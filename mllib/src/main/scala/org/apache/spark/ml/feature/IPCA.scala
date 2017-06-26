@@ -143,35 +143,33 @@ class IPCA (override val uid: String)
     val currentFeatures = input.first().size
     require($(k) <= currentFeatures,
       s"source vector size $currentFeatures must be no less than k=$k")
+    require(currentFeatures <= 65535,
+      s"source vector size $currentFeatures cannot be longer than 65535 to compute, due to constraints from RowMatrix")
 
 
-    val expVar: Array[Double] = Array.fill[Double](currentFeatures)(0)
+    // Initial batch PCA computation
 
-    if (this.samplesFit == 0) {
-      // Initial batch PCA computation
+    // Set the number of features. Used to enforce requirements
+    this.numFeatures = currentFeatures
 
-      // Set the number of features. Used to enforce requirements
-      this.numFeatures = currentFeatures
+    // Compute mean normalizer and transform data
+    val firstNormalizer = new NormalScaler(withMean = true, withStd = false)
+    this.meanNormalizer = firstNormalizer.fit(input)
+    val normalizedRM = new RowMatrix(this.meanNormalizer.transform(input))
 
-      // Compute mean normalizer and transform data
-      val firstNormalizer = new NormalScaler(withMean = true, withStd = false)
-      this.meanNormalizer = firstNormalizer.fit(input)
-      val normalizedRM = new RowMatrix(this.meanNormalizer.transform(input))
+    // Initialize number of samples fit
+    this.samplesFit = normalizedRM.numRows
 
-      // Initialize number of samples fit
-      this.samplesFit = normalizedRM.numRows
+    val initialSVD = normalizedRM.computeSVD(this.numFeatures,true)
 
-      val initialSVD = normalizedRM.computeSVD(this.numFeatures,true)
+    // Initial eigenvalues and eigenvectors
+    this.eigenvectors = OldMatrices.dense(initialSVD.U.numRows.toInt, initialSVD.U.numCols.toInt, initialSVD.U
+      .rows.map(_.toArray).collect.flatten).toDense
+    this.eigenvalues = OldVectors.dense(initialSVD.s.toArray).toDense
 
-      // Initial eigenvalues and eigenvectors
-      this.eigenvectors = OldMatrices.dense(initialSVD.U.numRows.toInt, initialSVD.U.numCols.toInt, initialSVD.U
-        .rows.map(_.toArray).collect.flatten).toDense
-      this.eigenvalues = OldVectors.dense(initialSVD.s.toArray).toDense
-
-      // Compute Explained Variance
-      val eigenSum = initialSVD.s.toArray.sum
-      val expVar = initialSVD.s.toArray.map(_ / eigenSum)
-    }
+    // Compute Explained Variance
+    val eigenSum = initialSVD.s.toArray.sum
+    val expVar = initialSVD.s.toArray.map(_ / eigenSum)
 
     val pc: OldDenseMatrix = OldMatrices.dense(this.numFeatures, $(k),
       Arrays.copyOfRange(this.eigenvectors.toArray, 0, this.numFeatures * $(k))).toDense
@@ -192,7 +190,7 @@ class IPCA (override val uid: String)
 
   /**
     * Computes an [[IPCAModel]] that contains the principal components of the total fit data set by combining the input
-    * vector with previous components. Should
+    * vector with previous components. Should only be called after an initial fit.
     * @param dataset
     * @param sc
     * @return
@@ -231,48 +229,38 @@ class IPCA (override val uid: String)
       .map(vector => OldVectors.dense(vector.toArray.map(_*sqrt(1-$(alpha)))))
 
     // Multiply previous eigenvectors by their corresponding eigenvalues
-    val prevEigenvectors = OldMatrices.diag(OldVectors.dense(this.eigenvalues
-      .toArray.map(eigVal => sqrt(eigVal*$(alpha)))))
-      .multiply(this.eigenvectors.transpose)
+    val prevEigenvectors = new OldDenseMatrix(this.eigenvectors.numCols, this.eigenvectors.numRows,
+      this.eigenvectors.transpose.toArray)
+      .multiply(OldMatrices.diag(OldVectors.dense(this.eigenvalues.toArray.map(eigVal => sqrt(eigVal*$(alpha))))).toDense)
 
-    val indexedVectors = normalizedVectors.zipWithIndex
-    // Combine the previous scaled eigenvectors with the new values.
-
-    // Convert to RDD
+    // Convert previous eigenvectors to RDD
     val tempColumns = prevEigenvectors.toArray.grouped(prevEigenvectors.numRows)
     val tempRows = tempColumns.toSeq.transpose
-    val prevEigenvectorsDenseSeq = tempRows.map(row => new OldDenseVector(row.toArray))
-    //val prevEigenvectorsDenseSeqArr = tempRows.map(row => row.toArray)
+    val prevEigenvectorsDenseSeq = tempRows.map(row => OldVectors.dense(row.toArray))
     val evRDD =  sc.parallelize(prevEigenvectorsDenseSeq, normalizedVectors.partitions.size)
-    val evRDDindexed = evRDD.zipWithIndex
 
-    val keyedVectors = indexedVectors.map(row => (row._2, row._1))
-    val keyedEigenvectors = evRDDindexed.map(row => (row._2, row._1))
-
-    val combinedRDD = keyedVectors.join(keyedEigenvectors)
-
-    val meltedRDD = combinedRDD.map(row => OldVectors.dense(row._2._1.toArray ++ row._2._2.toArray))
-
+    val combinedRDD = evRDD.union(normalizedVectors)
 
     // Compute gramian matrix and convert to breeze for SVD
-    val combinedMatrix = new RowMatrix(meltedRDD)
+    val combinedMatrix = new RowMatrix(combinedRDD)
     val approxMat = combinedMatrix.computeGramianMatrix
     val breezeApproxMat = new BDM(approxMat.numCols, approxMat.numRows, approxMat.toArray)
 
     // Compute SVD, excluding u
     val brzSvd.SVD(_,s,v) = brzSvd(breezeApproxMat)
 
-    // Incremented eigenvalues and eigenvectors
-    val freshEigenvectors = combinedMatrix.multiply(OldMatrices.dense(v.rows, v.rows, v.data))
-    this.eigenvectors = OldMatrices.dense(freshEigenvectors.numRows.toInt, freshEigenvectors.numCols.toInt, freshEigenvectors
-      .rows.map(_.toArray).collect.flatten).toDense
-    this.eigenvalues = OldVectors.dense(s.data).toDense
-
     // Compute Explained Variance
     val eigenSum = sumBreeze(s)
     val expVar = s.map(_ / eigenSum).toArray
 
-    // expVar is a breeze thing.
+    this.eigenvalues = OldVectors.dense(Arrays.copyOfRange(s.data, 0,$(k))).toDense
+
+    // Incremented eigenvalues and eigenvectors
+    val freshEigenvectors = combinedMatrix.multiply(OldMatrices.dense(v.rows, v.rows, v.data))
+
+    this.eigenvectors = OldMatrices.dense(this.numFeatures, $(k), Arrays.copyOfRange(freshEigenvectors
+      .rows.map(_.toArray).collect.flatten,0,this.numFeatures*$(k))).toDense
+
 
     val pc: OldDenseMatrix = OldMatrices.dense(this.numFeatures, $(k),
       Arrays.copyOfRange(this.eigenvectors.toArray, 0, this.numFeatures * $(k))).toDense
@@ -285,7 +273,6 @@ class IPCA (override val uid: String)
     } else {
       val pc = OldMatrices.dense(this.numFeatures, $(k),
         Arrays.copyOfRange(this.eigenvectors.toArray, 0, this.numFeatures * $(k)))
-      // expVar is null! Why is it not being computed?
       val explainedVariance = OldVectors.dense(Arrays.copyOfRange(expVar, 0, $(k)))
     }
     copyValues(new IPCAModel(uid, pc, explainedVariance).setParent(this))
